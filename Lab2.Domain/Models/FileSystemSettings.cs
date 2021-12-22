@@ -26,5 +26,13 @@ namespace Lab2.Domain.Models
 
         // for truncate optimization
         public const ushort NullDescriptor = ushort.MaxValue;
+
+        public const int MaxSymlinkInOneLookup = 255;
+
+        public const string Separator = "/";
+
+        public const string CurrentDirHardlink = ".";
+
+        public const string PrevDirHardlink = "..";
     }
 }

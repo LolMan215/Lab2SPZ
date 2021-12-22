@@ -23,14 +23,11 @@ namespace Lab2.Interop
         private ICollection<FileDescriptor> Descriptors =>
             FsFileStream.ReadStructs<FileDescriptor>(FileSystemSettings.DescriptorsOffset, _descriptorsCount);
 
-        private ICollection<FileMap> FileMaps =>
-            FsFileStream.ReadStructs<FileMap>(SizeHelper.GetBlocksOffset(_descriptorsCount),
-                FileSystemSettings.BlocksCount);
 
-        private ICollection<DirectoryEntry> RootFiles =>
-            FsFileStream.ReadStructs<DirectoryEntry>(SizeHelper.GetBlocksOffset(_descriptorsCount),
-                FileSystemSettings.BlockSize / SizeHelper.GetStructureSize<DirectoryEntry>());
+        private int _directoryEntriesInBlock
+            = FileSystemSettings.BlockSize / SizeHelper.GetStructureSize<DirectoryEntry>();
 
+  
         private Block RootBlock => GetBlock(0);
         private int _fd = 0;
         private readonly Dictionary<int, ushort> _openedFiles = new Dictionary<int, ushort>();
@@ -39,6 +36,10 @@ namespace Lab2.Interop
         {
             _fsSize = FileSystemSettings.BlocksCount * FileSystemSettings.BlockSize;
             _descriptorsCount = fsFileStream.ReadStruct<short>(FileSystemSettings.DescriptorsCountOffset);
+            if (Root.FileDescriptorType == FileDescriptorType.Unused)
+            {
+                Init();
+            }
         }
 
         #region Setters
@@ -170,6 +171,11 @@ namespace Lab2.Interop
             }
 
             var descriptorId = _openedFiles[fd];
+            WriteToFile(descriptorId, file, offset, size);
+        }
+
+        private void WriteToFile(ushort descriptorId, byte[] file, int offset, ushort size)
+        {
             var descriptor = GetFileDescriptor(descriptorId);
             if (descriptor.FileSize < offset + size)
             {
@@ -258,8 +264,10 @@ namespace Lab2.Interop
             SetFileDescriptor(descriptorId, descriptor);
         }
 
-        public override void CreateFile(string filename)
+        public override void CreateFile(string filename, ushort cwd = 0)
         {
+            var dir = PathHelper.GetDirectoryByPath(filename);
+            var directoryDescriptor = LookUp(dir, cwd);
             var descriptorId = GetFirstFreeDescriptor();
             var descriptor = new FileDescriptor
             {
@@ -271,7 +279,7 @@ namespace Lab2.Interop
             };
 
             SetFileDescriptor(descriptorId, descriptor);
-            AddLinkToDirectory(Root, filename, descriptorId);
+            AddLinkToDirectory(directoryDescriptor.Id, filename, descriptorId);
         }
 
         public override byte[] ReadFile(int fd, int offset, ushort size)
@@ -282,6 +290,11 @@ namespace Lab2.Interop
             }
 
             var descriptorId = _openedFiles[fd];
+            return ReadFile(descriptorId, offset, size);
+        }
+
+        private byte[] ReadFile(ushort descriptorId, int offset, ushort size)
+        {
             var descriptor = GetFileDescriptor(descriptorId);
             if (descriptor.FileSize < offset + size)
             {
@@ -341,42 +354,39 @@ namespace Lab2.Interop
             return ReadAllBlocks(blocks).Skip(bytesToSkip).Take(size).ToArray();
         }
 
-        public override void UnlinkFile(string filename)
+        public override void UnlinkFile(string filename, ushort cwd = 0)
         {
-            var descriptorId = FileLookUp(filename);
-            var descriptor = GetFileDescriptor(descriptorId);
+            var descriptor = LookUp(filename, cwd, false);
+            // var dirPath = filename[..filename.LastIndexOf(FileSystemSettings.Separator, StringComparison.Ordinal)];
+            var dirPath = PathHelper.GetDirectoryByPath(filename);
+            var directory = LookUp(dirPath, cwd);
+            RemoveLinkFromDirectory(GetFileDescriptor(directory.Id), PathHelper.GetFilenameByPath(filename));
             if (descriptor.References > 1 ||
-                _openedFiles.ContainsValue(descriptorId))
+                _openedFiles.ContainsValue(descriptor.Id))
             {
                 descriptor.References -= 1;
-                SetFileDescriptor(descriptorId, descriptor);
+                SetFileDescriptor(descriptor.Id, descriptor);
                 return;
             }
 
-            RemoveFileFromFs(descriptorId);
+            RemoveFileFromFs(descriptor.Id);
         }
 
-        public override void LinkFile(string existingFileName, string linkName)
+        public override void LinkFile(string existingFileName, string linkName, ushort cwd = 0)
         {
-            var descriptorId = FileLookUp(existingFileName);
-            var descriptor = GetFileDescriptor(descriptorId);
+            var descriptor = LookUp(existingFileName, cwd);
+            var descriptorId = descriptor.Id;
             descriptor.References++;
             SetFileDescriptor(descriptorId, descriptor);
-            AddLinkToDirectory(Root, linkName, descriptorId);
+            AddLinkToDirectory(Root.Id, linkName, descriptorId);
         }
 
-        public override FileDescriptor Truncate(string filename, ushort size)
+        public override FileDescriptor Truncate(string filename, ushort size, ushort cwd = 0)
         {
-            var descriptorId = FileLookUp(filename);
-            var descriptor = GetFileDescriptor(descriptorId);
+            var descriptor = LookUp(filename, cwd);
+            var descriptorId = descriptor.Id;
             var oldSize = descriptor.FileSize;
             descriptor.FileSize = size;
-            if (oldSize > size)
-            {
-                SetFileDescriptor(descriptorId, descriptor);
-                return descriptor;
-            }
-
             var oldBlocksCount = OpHelper.DivWithRoundUp(oldSize, FileSystemSettings.BlockSize);
             var newBlocksCount = OpHelper.DivWithRoundUp(size, FileSystemSettings.BlockSize);
             var oldMapsCount = OpHelper.DivWithRoundUp(
@@ -385,6 +395,17 @@ namespace Lab2.Interop
             var newMapsCount = OpHelper.DivWithRoundUp(
                 newBlocksCount - FileSystemSettings.DefaultBlocksInDescriptor,
                 FileSystemSettings.RefsInFileMap);
+            if (oldSize > size)
+            {
+                var blocksToFree = oldBlocksCount - newBlocksCount;
+                var lastBlockInMapIndex = (newBlocksCount - FileSystemSettings.DefaultBlocksInDescriptor)
+                                          % FileSystemSettings.RefsInFileMap;
+                var lastMapId = GetNthFileMap(descriptorId, newMapsCount - 1);
+                var blocks = ReadNBlocksAndMaps(lastMapId, lastBlockInMapIndex, Convert.ToUInt16(lastMapId));
+                FreeBlocks(blocks);
+                SetFileDescriptor(descriptorId, descriptor);
+                return descriptor;
+            }
 
             if (oldBlocksCount < FileSystemSettings.DefaultBlocksInDescriptor)
             {
@@ -412,17 +433,9 @@ namespace Lab2.Interop
                 }
                 else
                 {
-                    lastMap = GetFileMap(GetNthFileMap(descriptorId, oldMapsCount));
+                    mapId = GetNthFileMap(descriptorId, oldMapsCount);
+                    lastMap = GetFileMap(mapId);
                 }
-
-                // var mapNum = 1;
-                // var mapId = descriptor.MapIndex;
-                // while (mapNum != oldMapsCount)
-                // {
-                //     mapId = lastMap.NextMapIndex;
-                //     lastMap = GetFileMap(mapId);
-                //     mapNum++;
-                // }
 
                 var placeUsedInLastFileMap = oldBlocksCount - FileSystemSettings.DefaultBlocksInDescriptor >= 0
                     ? (oldBlocksCount - FileSystemSettings.DefaultBlocksInDescriptor) % FileSystemSettings.RefsInFileMap
@@ -463,10 +476,10 @@ namespace Lab2.Interop
             return descriptor;
         }
 
-        public override int OpenFile(string filename)
+        public override int OpenFile(string filename, ushort cwd = 0)
         {
-            var descriptor = FileLookUp(filename);
-            _openedFiles.Add(++_fd, descriptor);
+            var descriptor = LookUp(filename, cwd);
+            _openedFiles.Add(++_fd, descriptor.Id);
             return _fd;
         }
 
@@ -487,14 +500,167 @@ namespace Lab2.Interop
             }
         }
 
-        public override List<DirectoryEntry> DirectoryList()
+        public override void MakeDirectory(string directoryName, ushort cwd = 0)
         {
-            var descriptor = Cwd;
-            var blockId = descriptor.Blocks[0];
-            var directoryEntries =
-                FsFileStream.ReadStructs<DirectoryEntry>(
-                    GetBlockOffset(blockId),
-                    descriptor.FileSize / SizeHelper.GetStructureSize<DirectoryEntry>());
+            var parentDirPath = PathHelper.GetDirectoryByPath(directoryName);
+            var fileName = PathHelper.GetFilenameByPath(directoryName);
+            var parentDirDescriptor = LookUp(parentDirPath, cwd);
+            var descriptor = new FileDescriptor
+            {
+                Id = GetFirstFreeDescriptor(),
+                FileDescriptorType = FileDescriptorType.Directory,
+                FileSize = 0,
+                References = 1,
+                Blocks = new ushort[]
+                {
+                    FileSystemSettings.NullDescriptor,
+                    FileSystemSettings.NullDescriptor,
+                    FileSystemSettings.NullDescriptor,
+                    FileSystemSettings.NullDescriptor,
+                },
+                MapIndex = 0
+            };
+            SetFileDescriptor(descriptor.Id, descriptor);
+            AddLinkToDirectory(descriptor.Id, ".", descriptor.Id);
+            AddLinkToDirectory(descriptor.Id, "..", parentDirDescriptor.Id);
+            AddLinkToDirectory(parentDirDescriptor.Id, fileName, descriptor.Id);
+        }
+
+        public override void RemoveDirectory(string directoryName, ushort cwd = 0)
+        {
+            var parentDirPath = PathHelper.GetDirectoryByPath(directoryName);
+            var fileName = PathHelper.GetFilenameByPath(directoryName);
+            var parentDirDescriptor = LookUp(parentDirPath, cwd);
+            var fileDescriptor = LookUp(fileName, cwd);
+            if (fileDescriptor.Id == Root.Id)
+            {
+                throw new Exception("cannot delete root");
+            }
+
+            var directoryEntries = GetDirectoryEntries(fileDescriptor.Id).SelectMany(x => x);
+            if (directoryEntries.Any(
+                de => de.Name != FileSystemSettings.CurrentDirHardlink &&
+                      de.Name != FileSystemSettings.PrevDirHardlink &&
+                      de.IsValid))
+            {
+                throw new Exception("Directory is not empty");
+            }
+
+            UnlinkFile(fileName, cwd);
+        }
+
+        public override void CreateSymlink(string path, string payload, ushort cwd = 0)
+        {
+            var pathToDir = PathHelper.GetDirectoryByPath(path);
+            var fileName = PathHelper.GetFilenameByPath(path);
+            var dirDescriptor = LookUp(pathToDir, cwd);
+            if (dirDescriptor.FileDescriptorType != FileDescriptorType.Directory)
+            {
+                throw new Exception("Directory not found");
+            }
+
+            var descriptorId = GetFirstFreeDescriptor();
+
+            var fileDescriptor = new FileDescriptor
+            {
+                Id = descriptorId,
+                FileDescriptorType = FileDescriptorType.Symlink,
+                Blocks = new[]
+                {
+                    FileSystemSettings.NullDescriptor,
+                    FileSystemSettings.NullDescriptor,
+                    FileSystemSettings.NullDescriptor,
+                    FileSystemSettings.NullDescriptor,
+                },
+                References = 1,
+                FileSize = Convert.ToUInt16(payload.Length),
+                MapIndex = FileSystemSettings.NullDescriptor,
+            };
+            SetFileDescriptor(descriptorId, fileDescriptor);
+
+            AddLinkToDirectory(dirDescriptor.Id, fileName, fileDescriptor.Id);
+            WriteToFile(fileDescriptor.Id, Encoding.Default.GetBytes(payload), 0, Convert.ToUInt16(payload.Length));
+        }
+
+        public override FileDescriptor LookUp(string path,
+            ushort cwd = 0,
+            bool resolveSymlink = true,
+            int symlinkMaxCount = FileSystemSettings.MaxSymlinkInOneLookup)
+        {
+            if (path == FileSystemSettings.Separator)
+            {
+                return Root;
+            }
+
+            // remove trailing slash
+            if (path.EndsWith(FileSystemSettings.Separator))
+            {
+                path = path[..^1];
+            }
+
+            var directory = path.StartsWith(FileSystemSettings.Separator) ? Root : GetFileDescriptor(cwd);
+
+            if (path.StartsWith(FileSystemSettings.Separator))
+            {
+                path = path[1..];
+            }
+
+            if (path.Contains(FileSystemSettings.Separator))
+            {
+                var name = path[..path.IndexOf(FileSystemSettings.Separator, StringComparison.Ordinal)];
+                var continuePath = path[(path.IndexOf(FileSystemSettings.Separator, StringComparison.Ordinal) + 1)..];
+
+                var directoryEntries = GetDirectoryEntries(directory.Id);
+                var nextDir = directoryEntries.SelectMany(d => d)
+                    .First(d => d.Name == name);
+
+                var nextDirDescriptor = GetFileDescriptor(nextDir.FileDescriptorId);
+                if (nextDirDescriptor.FileDescriptorType == FileDescriptorType.Symlink)
+                {
+                    if (symlinkMaxCount == 0)
+                    {
+                        throw new Exception("Exceeded max symlink count");
+                    }
+
+                    var value = ReadFile(nextDirDescriptor.Id, 0, nextDirDescriptor.FileSize);
+                    var symlinkString = System.Text.Encoding.Default.GetString(value);
+                    continuePath = $"{symlinkString}/{continuePath}";
+                }
+
+                return LookUp(
+                    continuePath,
+                    nextDirDescriptor.Id,
+                    resolveSymlink,
+                    symlinkMaxCount - 1);
+            }
+            else
+            {
+                var name = path;
+                var directoryEntries = GetDirectoryEntries(directory.Id);
+                var file = directoryEntries.SelectMany(d => d)
+                    .First(d => d.Name == name);
+                var fileDescriptor = GetFileDescriptor(file.FileDescriptorId);
+                if (fileDescriptor.FileDescriptorType == FileDescriptorType.Symlink && resolveSymlink)
+                {
+                    var value = ReadFile(fileDescriptor.Id, 0, fileDescriptor.FileSize);
+                    var symlinkString = System.Text.Encoding.Default.GetString(value);
+
+                    return LookUp(
+                        symlinkString,
+                        cwd,
+                        true,
+                        symlinkMaxCount - 1);
+                }
+
+                return GetFileDescriptor(file.FileDescriptorId);
+            }
+        }
+
+        public override List<DirectoryEntry> DirectoryList(ushort directoryDescriptorId = 0)
+        {
+            var directoryEntries = GetDirectoryEntries(directoryDescriptorId)
+                .SelectMany(d => d)
+                .Where(d => d.IsValid);
             return directoryEntries.ToList();
         }
 
@@ -510,19 +676,6 @@ namespace Lab2.Interop
             }
 
             throw new Exception("No free descriptor found");
-        }
-
-        private int GetFirstFreeBlock()
-        {
-            var takeBytes = 16;
-            for (short i = 0; i < FileSystemSettings.BlocksCount / 8 / 16; i++)
-            {
-                var bitmask = GetBitmask(i * takeBytes, takeBytes);
-                var firstFree = bitmask.GetIndexOfFirst(FileSystemSettings.BitmaskFreeBit);
-                return i * takeBytes * 8 + firstFree;
-            }
-
-            throw new Exception("No free block found");
         }
 
         private ushort GetFirstFreeBlockAndReserve()
@@ -550,109 +703,65 @@ namespace Lab2.Interop
             return SizeHelper.GetBlocksOffset(_descriptorsCount) + FileSystemSettings.BlockSize * blockIndex;
         }
 
-        private void AddLinkToDirectory(FileDescriptor directoryDescriptor, string filename, ushort fileDescriptorId)
+        private void AddLinkToDirectory(ushort directoryDescriptorId, string filename, ushort fileDescriptorId)
         {
+            var directoryDescriptor = GetFileDescriptor(directoryDescriptorId);
             if (directoryDescriptor.FileDescriptorType != FileDescriptorType.Directory)
             {
                 throw new Exception("Internal error, directory descriptor");
             }
 
-            var directoryBlock = GetBlock(directoryDescriptor.Blocks[0]);
+            var info = GetFirstFreeDirectoryEntry(directoryDescriptorId);
+            directoryDescriptor = GetFileDescriptor(directoryDescriptorId);
             var directoryEntry = new DirectoryEntry
             {
                 Name = filename,
                 IsValid = true,
                 FileDescriptorId = fileDescriptorId,
             }.ToByteArray();
-            for (int i = directoryDescriptor.FileSize; i < directoryDescriptor.FileSize + directoryEntry.Length; i++)
+            var blockId = info.blockId;
+            var block = GetBlock(blockId);
+            if (blockId == FileSystemSettings.NullDescriptor)
             {
-                directoryBlock.Data[i] = directoryEntry[i - directoryDescriptor.FileSize];
+                blockId = GetFirstFreeBlockAndReserve();
             }
 
-            directoryDescriptor.FileSize += Convert.ToUInt16(directoryEntry.Length);
-            directoryDescriptor.References++;
-            SetFileDescriptor(directoryDescriptor.Id, directoryDescriptor);
-            SetBlock(directoryDescriptor.Blocks[0], directoryBlock);
+            directoryEntry.CopyTo(block.Data, info.dEntryId * SizeHelper.GetStructureSize<DirectoryEntry>());
+            SetBlock(blockId, block);
         }
 
-        private byte[] ReadFileMapEntries(ushort fileMapIndex, int offset, ushort fileSize, int? totalBlocks = null)
+        private void RemoveLinkFromDirectory(FileDescriptor directoryDescriptor, string filename)
         {
-            var result = new byte[fileSize];
-            totalBlocks ??= OpHelper.DivWithRoundUp(fileSize, FileSystemSettings.BlockSize);
-            var blocksToRead = totalBlocks > FileSystemSettings.RefsInFileMap
-                ? FileSystemSettings.RefsInFileMap
-                : totalBlocks.Value;
-            var fileMap = GetFileMap(fileMapIndex);
-            var blockIndexes =
-                FsFileStream.ReadStructs<ushort>(GetBlockOffset(fileMapIndex), FileSystemSettings.RefsInFileMap)
-                    .Skip(offset)
-                    .ToList();
-            for (var i = 0; i < blocksToRead; i++)
+            if (directoryDescriptor.FileDescriptorType != FileDescriptorType.Directory)
             {
-                var bytesToRead = fileSize - i * FileSystemSettings.BlockSize >= FileSystemSettings.BlockSize
-                    ? FileSystemSettings.BlockSize
-                    : fileSize - i * FileSystemSettings.BlockSize;
-                var block = GetBlock(blockIndexes[i]);
-                block.Data.Take(bytesToRead).ToArray().CopyTo(result, i * FileSystemSettings.BlockSize);
+                throw new Exception("Internal error, directory descriptor");
             }
 
-            if (blocksToRead < totalBlocks)
+            var (entry, blockId, result) = GetFirstDirectoryEntry(directoryDescriptor.Id, filename);
+            if (!result)
             {
-                ReadFileMapEntries(fileMap.NextMapIndex,
-                        0,
-                        Convert.ToUInt16(fileSize - FileSystemSettings.BlockSize * blocksToRead),
-                        totalBlocks - FileSystemSettings.BlockSize)
-                    .CopyTo(result, blocksToRead * FileSystemSettings.BlockSize);
+                throw new Exception($"file with name {filename} not found");
             }
 
-            return result;
-        }
+            var block = GetBlock(blockId);
 
-        private byte[] ReadFileMapEntries(ushort fileMapIndex, int offset, int count)
-        {
-            if (offset > FileSystemSettings.RefsInFileMap)
-            {
-                throw new Exception("offset is too big");
-            }
+            var entries = FsFileStream
+                .ReadStructs<DirectoryEntry>(GetBlockOffset(blockId), _directoryEntriesInBlock)
+                .ToList();
+            var entryIndex = entries
+                .Select((entry, index) => (entry, index))
+                .First(tuple => tuple.entry.Name == filename)
+                .index;
 
-            var result = new byte[FileSystemSettings.BlockSize * count];
-            var fileMap = GetFileMap(fileMapIndex);
-            var blockIndexes =
-                FsFileStream.ReadStructs<ushort>(GetBlockOffset(fileMapIndex), FileSystemSettings.RefsInFileMap)
-                    .Skip(offset)
-                    .Take(count)
-                    .ToList();
-            for (var i = 0; i < FileSystemSettings.RefsInFileMap - offset && i < count; i++)
+            var newEntry = new DirectoryEntry
             {
-                var block = GetBlock(blockIndexes[i]);
-                block.Data.CopyTo(result, i * FileSystemSettings.BlockSize);
-            }
-
-            if (FileSystemSettings.RefsInFileMap - offset < count)
-            {
-                ReadFileMapEntries(fileMap.NextMapIndex,
-                        0,
-                        count - (FileSystemSettings.RefsInFileMap - offset))
-                    .CopyTo(result, FileSystemSettings.BlockSize * offset - FileSystemSettings.RefsInFileMap);
-            }
-
-            return result;
-        }
-
-        private ushort FileLookUp(string fileName)
-        {
-            var filesCount = Root.FileSize / SizeHelper.GetStructureSize<DirectoryEntry>();
-            try
-            {
-                return FsFileStream
-                    .ReadStructs<DirectoryEntry>(SizeHelper.GetBlocksOffset(_descriptorsCount), filesCount)
-                    .Single(de => de.Name == fileName)
-                    .FileDescriptorId;
-            }
-            catch (Exception e)
-            {
-                throw new Exception($"File with name {fileName} not found");
-            }
+                Name = "file",
+                IsValid = false,
+                FileDescriptorId = 0
+            };
+            var byteArr = newEntry.ToByteArray();
+            byteArr.CopyTo(block.Data, entryIndex * SizeHelper.GetStructureSize<DirectoryEntry>());
+            SetBlock(blockId, block);
         }
 
         private void RemoveFileFromFs(ushort fileDescriptorId)
@@ -832,6 +941,262 @@ namespace Lab2.Interop
             }
 
             return result;
+        }
+
+        private List<ushort> ReadNBlocksAndMaps(ushort mapId, int offset, ushort count)
+        {
+            if (offset > FileSystemSettings.RefsInFileMap)
+            {
+                throw new Exception($"offset is bigger than count of refs in fileMap");
+            }
+
+            var result = new List<ushort>(count);
+            var map = GetFileMap(mapId);
+            if (FileSystemSettings.RefsInFileMap - offset < count)
+            {
+                result.AddRange(map.Indexes.Skip(offset));
+                result.Add(map.NextMapIndex);
+                result.AddRange(ReadNBlocksAndMaps(map.NextMapIndex, 0,
+                    Convert.ToUInt16(count - (FileSystemSettings.RefsInFileMap - offset))));
+                return result;
+            }
+
+            result.AddRange(map.Indexes.Skip(offset).Take(count));
+            return result;
+        }
+
+        private void FreeBlocks(List<ushort> blockIds)
+        {
+            foreach (var blockId in blockIds)
+            {
+                SetBitFree(blockId);
+            }
+        }
+
+        private List<List<DirectoryEntry>> GetDirectoryEntries(ushort directoryDescriptorId)
+        {
+            var descriptor = GetFileDescriptor(directoryDescriptorId);
+            var blocksToTake = descriptor.FileSize / FileSystemSettings.BlockSize;
+            var blocks = new List<ushort>(blocksToTake);
+            var blocksToTakeFromDescriptor = blocksToTake <= FileSystemSettings.DefaultBlocksInDescriptor
+                ? blocksToTake
+                : FileSystemSettings.DefaultBlocksInDescriptor;
+            for (
+                ushort i = 0;
+                i < blocksToTakeFromDescriptor;
+                i++)
+            {
+                blocks.Add(descriptor.Blocks[i]);
+            }
+
+            if (blocksToTake > blocksToTakeFromDescriptor)
+            {
+                var blocksToTakeFromMaps = blocksToTake - blocksToTakeFromDescriptor;
+                blocks.AddRange(ReadNElementsFromFileMap(descriptor.MapIndex, 0, blocksToTakeFromDescriptor));
+            }
+
+            var result = blocks.Select(b => FsFileStream
+                    .ReadStructs<DirectoryEntry>(GetBlockOffset(b), _directoryEntriesInBlock).ToList())
+                .ToList();
+            return result;
+        }
+
+        private (ushort blockId, ushort dEntryId) GetFirstFreeDirectoryEntry(ushort directoryDescriptorId)
+        {
+            var descriptor = GetFileDescriptor(directoryDescriptorId);
+            var blocksToTake = descriptor.FileSize / FileSystemSettings.BlockSize;
+            var blocks = new List<ushort>(blocksToTake);
+            var blocksToTakeFromDescriptor = blocksToTake <= FileSystemSettings.DefaultBlocksInDescriptor
+                ? blocksToTake
+                : FileSystemSettings.DefaultBlocksInDescriptor;
+            for (
+                ushort i = 0;
+                i < blocksToTakeFromDescriptor;
+                i++)
+            {
+                blocks.Add(descriptor.Blocks[i]);
+            }
+
+            foreach (var descriptorBlock in blocks)
+            {
+                var (id, result) = FindFreeEntryInBlock(descriptorBlock);
+                if (!result) continue;
+                return (descriptorBlock, id);
+            }
+
+            blocks.RemoveAll(_ => true);
+
+            if (blocksToTakeFromDescriptor < blocksToTake)
+            {
+                blocks.AddRange(
+                    ReadNElementsFromFileMap(descriptor.MapIndex, 0, blocksToTake - blocksToTakeFromDescriptor));
+                foreach (var mapBlock in blocks)
+                {
+                    var (id, result) = FindFreeEntryInBlock(mapBlock);
+                    if (!result) continue;
+                    return (mapBlock, id);
+                }
+            }
+
+            var newBlockId = GetFirstFreeBlockAndReserve();
+            var newBlock = GetBlock(FileSystemSettings.NullDescriptor);
+            var entry = new DirectoryEntry
+            {
+                Name = "empty",
+                IsValid = false,
+                FileDescriptorId = 0,
+            }.ToByteArray();
+            entry.CopyTo(newBlock.Data, 0);
+            SetBlock(newBlockId, newBlock);
+
+            if (descriptor.FileSize < FileSystemSettings.DefaultBlocksSize)
+            {
+                var newDefaultBlockId = descriptor.FileSize / FileSystemSettings.BlockSize;
+                descriptor.Blocks[newDefaultBlockId] = newBlockId;
+                descriptor.FileSize += FileSystemSettings.BlockSize;
+                SetFileDescriptor(directoryDescriptorId, descriptor);
+                return (newBlockId, 0);
+            }
+
+            ushort lastFileMapId;
+            FileMap lastFileMap;
+            ushort newFileMapId;
+            FileMap newFileMap;
+
+            if (descriptor.FileSize == FileSystemSettings.DefaultBlocksSize)
+            {
+                newFileMapId = GetFirstFreeBlockAndReserve();
+                newFileMap = GetFileMap(FileSystemSettings.NullDescriptor);
+                SetFileMap(newFileMapId, newFileMap);
+                descriptor.MapIndex = newFileMapId;
+                SetFileDescriptor(directoryDescriptorId, descriptor);
+                newFileMap.Indexes[0] = newBlockId;
+                SetFileMap(newFileMapId, newFileMap);
+            }
+            else if (blocksToTake - blocksToTakeFromDescriptor < FileSystemSettings.RefsInFileMap)
+            {
+                lastFileMapId = GetNthFileMap(directoryDescriptorId,
+                    (blocksToTake - FileSystemSettings.DefaultBlocksInDescriptor) / FileSystemSettings.RefsInFileMap);
+                lastFileMap = GetFileMap(lastFileMapId);
+                var blocksInFileMap = blocksToTake - blocksToTakeFromDescriptor;
+                lastFileMap.Indexes[blocksInFileMap] = newBlockId;
+                SetFileMap(lastFileMapId, lastFileMap);
+            }
+            else
+            {
+                lastFileMapId = GetNthFileMap(directoryDescriptorId,
+                    (blocksToTake - FileSystemSettings.DefaultBlocksInDescriptor) / FileSystemSettings.RefsInFileMap);
+                lastFileMap = GetFileMap(lastFileMapId);
+                newFileMapId = GetFirstFreeBlockAndReserve();
+                newFileMap = GetFileMap(FileSystemSettings.NullDescriptor);
+                lastFileMap.NextMapIndex = newFileMapId;
+                SetFileMap(lastFileMapId, lastFileMap);
+                newFileMap.Indexes[0] = newBlockId;
+                SetFileMap(newFileMapId, newFileMap);
+            }
+
+            descriptor.FileSize += FileSystemSettings.BlockSize;
+            SetFileDescriptor(directoryDescriptorId, descriptor);
+            return (newBlockId, 0);
+        }
+
+        private (DirectoryEntry entry, ushort blockId, bool result) GetFirstDirectoryEntry(ushort directoryDescriptorId,
+            string fileName)
+        {
+            var descriptor = GetFileDescriptor(directoryDescriptorId);
+            var blocksToTake = descriptor.FileSize / FileSystemSettings.BlockSize;
+            var blocks = new List<ushort>(blocksToTake);
+            var blocksToTakeFromDescriptor = blocksToTake <= FileSystemSettings.DefaultBlocksInDescriptor
+                ? blocksToTake
+                : FileSystemSettings.DefaultBlocksInDescriptor;
+            for (
+                ushort i = 0;
+                i < blocksToTakeFromDescriptor;
+                i++)
+            {
+                blocks.Add(descriptor.Blocks[i]);
+            }
+
+            foreach (var descriptorBlock in blocks)
+            {
+                var (foundEntry, result) = FindEntryInBlock(descriptorBlock, fileName);
+                if (!result) continue;
+                return (foundEntry, descriptorBlock, true);
+            }
+
+            blocks.RemoveAll(_ => true);
+
+            if (blocksToTakeFromDescriptor < blocksToTake)
+            {
+                blocks.AddRange(
+                    ReadNElementsFromFileMap(descriptor.MapIndex, 0, blocksToTake - blocksToTakeFromDescriptor));
+                foreach (var mapBlock in blocks)
+                {
+                    var (foundEntry, result) = FindEntryInBlock(mapBlock, fileName);
+                    if (!result) continue;
+                    return (foundEntry, mapBlock, true);
+                }
+            }
+
+            return (new DirectoryEntry(), 0, false);
+        }
+
+        private (ushort id, bool result) FindFreeEntryInBlock(ushort blockId)
+        {
+            var entries = FsFileStream
+                .ReadStructs<DirectoryEntry>(GetBlockOffset(blockId), _directoryEntriesInBlock)
+                .ToList();
+            var entryExist = entries
+                .Select((entry, index) => (entry, index))
+                .Any(tuple => !tuple.entry.IsValid);
+            if (!entryExist) return (0, false);
+            var entryIndex = Convert.ToUInt16(entries
+                .Select((entry, index) => (entry, index))
+                .First(tuple => !tuple.entry.IsValid)
+                .index);
+            return (entryIndex, true);
+        }
+
+        private (DirectoryEntry entry, bool result) FindEntryInBlock(ushort blockId, string fileName)
+        {
+            var entries = FsFileStream
+                .ReadStructs<DirectoryEntry>(GetBlockOffset(blockId), _directoryEntriesInBlock)
+                .ToList();
+            var entryExist = entries
+                .Select((entry, index) => (entry, index))
+                .Any(tuple => tuple.entry.Name == fileName);
+            if (!entryExist) return (new DirectoryEntry(), false);
+            var entry = entries
+                .Select((entry, index) => (entry, index))
+                .First(tuple => tuple.entry.Name == fileName)
+                .entry;
+            return (entry, true);
+        }
+
+        private void Init()
+        {
+            var root = new FileDescriptor
+            {
+                Id = 0,
+                FileDescriptorType = FileDescriptorType.Directory,
+                FileSize = 0,
+                References = 1,
+                Blocks = new ushort[]
+                {
+                    FileSystemSettings.NullDescriptor,
+                    FileSystemSettings.NullDescriptor,
+                    FileSystemSettings.NullDescriptor,
+                    FileSystemSettings.NullDescriptor,
+                },
+                MapIndex = 0
+            };
+            SetFileDescriptor(root.Id, root);
+
+            var rootDirBlockId = GetFirstFreeBlockAndReserve();
+            var rootDirBlock = GetBlock(FileSystemSettings.NullDescriptor);
+            Encoding.Default.GetBytes(FileSystemSettings.Separator).CopyTo(rootDirBlock.Data, 0);
+            SetBlock(rootDirBlockId, rootDirBlock);
+            AddLinkToDirectory(0, FileSystemSettings.CurrentDirHardlink, 0);
         }
     }
 }
