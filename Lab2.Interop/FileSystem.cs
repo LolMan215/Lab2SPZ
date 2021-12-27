@@ -582,79 +582,75 @@ namespace Lab2.Interop
             WriteToFile(fileDescriptor.Id, Encoding.Default.GetBytes(payload), 0, Convert.ToUInt16(payload.Length));
         }
 
-        public override FileDescriptor LookUp(string path,
-            ushort cwd = 0,
-            bool resolveSymlink = true,
-            int symlinkMaxCount = FileSystemSettings.MaxSymlinkInOneLookup)
+        public override FileDescriptor LookUp(string path, ushort cwd = 0, bool resolveSymlink = true, int symlinkMaxCount = FileSystemSettings.MaxSymlinkInOneLookup)
         {
-            if (path == FileSystemSettings.Separator)
+            while (true)
             {
-                return Root;
-            }
-
-            // remove trailing slash
-            if (path.EndsWith(FileSystemSettings.Separator))
-            {
-                path = path[..^1];
-            }
-
-            var directory = path.StartsWith(FileSystemSettings.Separator) ? Root : GetFileDescriptor(cwd);
-
-            if (path.StartsWith(FileSystemSettings.Separator))
-            {
-                path = path[1..];
-            }
-
-            if (path.Contains(FileSystemSettings.Separator))
-            {
-                var name = path[..path.IndexOf(FileSystemSettings.Separator, StringComparison.Ordinal)];
-                var continuePath = path[(path.IndexOf(FileSystemSettings.Separator, StringComparison.Ordinal) + 1)..];
-
-                var directoryEntries = GetDirectoryEntries(directory.Id);
-                var nextDir = directoryEntries.SelectMany(d => d)
-                    .First(d => d.Name == name);
-
-                var nextDirDescriptor = GetFileDescriptor(nextDir.FileDescriptorId);
-                if (nextDirDescriptor.FileDescriptorType == FileDescriptorType.Symlink)
+                if (path == FileSystemSettings.Separator)
                 {
-                    if (symlinkMaxCount == 0)
+                    return Root;
+                }
+           
+                if (path.EndsWith(FileSystemSettings.Separator))
+                {
+                    path = path[..^1];
+                }
+
+                var directory = path.StartsWith(FileSystemSettings.Separator) ? Root : GetFileDescriptor(cwd);
+
+                if (path.StartsWith(FileSystemSettings.Separator))
+                {
+                    path = path[1..];
+                }
+
+                if (path.Contains(FileSystemSettings.Separator))
+                {
+                    var name = path[..path.IndexOf(FileSystemSettings.Separator, StringComparison.Ordinal)];
+                    var continuePath = path[(path.IndexOf(FileSystemSettings.Separator, StringComparison.Ordinal) + 1)..];
+
+                    var directoryEntries = GetDirectoryEntries(directory.Id);
+                    var nextDir = directoryEntries.SelectMany(d => d)
+                        .First(d => d.Name == name);
+
+                    var nextDirDescriptor = GetFileDescriptor(nextDir.FileDescriptorId);
+                    if (nextDirDescriptor.FileDescriptorType == FileDescriptorType.Symlink)
                     {
-                        throw new Exception("Exceeded max symlink count");
+                        if (symlinkMaxCount == 0)
+                        {
+                            throw new Exception("Exceeded max symlink count");
+                        }
+
+                        var value = ReadFile(nextDirDescriptor.Id, 0, nextDirDescriptor.FileSize);
+                        var symlinkString = System.Text.Encoding.Default.GetString(value);
+                        continuePath = $"{symlinkString}/{continuePath}";
                     }
 
-                    var value = ReadFile(nextDirDescriptor.Id, 0, nextDirDescriptor.FileSize);
-                    var symlinkString = System.Text.Encoding.Default.GetString(value);
-                    continuePath = $"{symlinkString}/{continuePath}";
+                    path = continuePath;
+                    cwd = nextDirDescriptor.Id;
+                    symlinkMaxCount = symlinkMaxCount - 1;
                 }
-
-                return LookUp(
-                    continuePath,
-                    nextDirDescriptor.Id,
-                    resolveSymlink,
-                    symlinkMaxCount - 1);
-            }
-            else
-            {
-                var name = path;
-                var directoryEntries = GetDirectoryEntries(directory.Id);
-                var file = directoryEntries.SelectMany(d => d)
-                    .First(d => d.Name == name);
-                var fileDescriptor = GetFileDescriptor(file.FileDescriptorId);
-                if (fileDescriptor.FileDescriptorType == FileDescriptorType.Symlink && resolveSymlink)
+                else
                 {
-                    var value = ReadFile(fileDescriptor.Id, 0, fileDescriptor.FileSize);
-                    var symlinkString = System.Text.Encoding.Default.GetString(value);
+                    var name = path;
+                    var directoryEntries = GetDirectoryEntries(directory.Id);
+                    var file = directoryEntries.SelectMany(d => d)
+                        .First(d => d.Name == name);
+                    var fileDescriptor = GetFileDescriptor(file.FileDescriptorId);
+                    if (fileDescriptor.FileDescriptorType == FileDescriptorType.Symlink && resolveSymlink)
+                    {
+                        var value = ReadFile(fileDescriptor.Id, 0, fileDescriptor.FileSize);
+                        var symlinkString = Encoding.Default.GetString(value);
 
-                    return LookUp(
-                        symlinkString,
-                        cwd,
-                        true,
-                        symlinkMaxCount - 1);
+                        path = symlinkString;
+                        resolveSymlink = true;
+                        symlinkMaxCount = symlinkMaxCount - 1;
+                        continue;
+                    }
+
+                    return GetFileDescriptor(file.FileDescriptorId);
                 }
-
-                return GetFileDescriptor(file.FileDescriptorId);
             }
-        }
+        }      
 
         public override List<DirectoryEntry> DirectoryList(ushort directoryDescriptorId = 0)
         {
