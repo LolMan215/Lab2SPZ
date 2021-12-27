@@ -481,7 +481,7 @@ namespace Lab2.Interop
              var descriptor = FileLookUp(filename, cwd);
             _fd = 0;
 
-            for(int i = 1; i <= _openedFiles.Count; i++)
+            for(int i = 1; i <= _openedFiles.Count+1; i++)
             {
                 if (!_openedFiles.ContainsKey(i))
                 {
