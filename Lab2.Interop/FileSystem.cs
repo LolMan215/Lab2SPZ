@@ -478,7 +478,7 @@ namespace Lab2.Interop
 
         public override int OpenFile(string filename, ushort cwd = 0)
         {
-             var descriptor = FileLookUp(filename, cwd);
+             var descriptor = LookUp(filename, cwd);
             _fd = 0;
 
             for(int i = 1; i <= _openedFiles.Count+1; i++)
@@ -493,7 +493,7 @@ namespace Lab2.Interop
                     _fd = i;
                 }
             }
-            _openedFiles.Add(_fd, descriptor);
+            _openedFiles.Add(_fd, descriptor.Id);
             return _fd;
         }
 
@@ -596,7 +596,10 @@ namespace Lab2.Interop
             WriteToFile(fileDescriptor.Id, Encoding.Default.GetBytes(payload), 0, Convert.ToUInt16(payload.Length));
         }
 
-        public override FileDescriptor LookUp(string path, ushort cwd = 0, bool resolveSymlink = true, int symlinkMaxCount = FileSystemSettings.MaxSymlinkInOneLookup)
+        public override FileDescriptor LookUp(string path,
+            ushort cwd = 0,
+            bool resolveSymlink = true,
+            int symlinkMaxCount = FileSystemSettings.MaxSymlinkInOneLookup)
         {
             while (true)
             {
