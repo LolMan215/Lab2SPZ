@@ -478,8 +478,22 @@ namespace Lab2.Interop
 
         public override int OpenFile(string filename, ushort cwd = 0)
         {
-            var descriptor = LookUp(filename, cwd);
-            _openedFiles.Add(++_fd, descriptor.Id);
+             var descriptor = FileLookUp(filename, cwd);
+            _fd = 0;
+
+            for(int i = 1; i <= _openedFiles.Count+1; i++)
+            {
+                if (!_openedFiles.ContainsKey(i))
+                {
+                    _openedFiles.Add(i, descriptor.Id);
+                    return i;
+                }
+                else
+                {
+                    _fd = i;
+                }
+            }
+            _openedFiles.Add(_fd, descriptor);
             return _fd;
         }
 
